@@ -1,0 +1,8 @@
+server:
+  port: 8085
+
+spring:
+  application:
+    name: wallet-service
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/eshoppingzone_wallet?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true

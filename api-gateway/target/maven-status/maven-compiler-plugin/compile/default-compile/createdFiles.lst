@@ -1,0 +1,3 @@
+com\eshoppingzone\gateway\util\JwtUtil.class
+com\eshoppingzone\gateway\ApiGatewayApplication.class
+com\eshoppingzone\gateway\filter\AuthenticationFilter.class
