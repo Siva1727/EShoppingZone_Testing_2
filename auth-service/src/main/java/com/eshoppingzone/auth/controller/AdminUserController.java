@@ -4,6 +4,8 @@ import com.eshoppingzone.auth.dto.ApiResponse;
 import com.eshoppingzone.auth.dto.CreateUserRequest;
 import com.eshoppingzone.auth.dto.UpdateStatusRequest;
 import com.eshoppingzone.auth.dto.UserDto;
+import com.eshoppingzone.auth.entity.Role;
+import com.eshoppingzone.auth.entity.UserStatus;
 import com.eshoppingzone.auth.service.AuthService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -35,9 +37,11 @@ public class AdminUserController {
     }
 
     @GetMapping
-    @Operation(summary = "Get All Users (Admin Only)", description = "List all registered users in the platform")
-    public ResponseEntity<ApiResponse<List<UserDto>>> getAllUsers() {
-        List<UserDto> users = authService.getAllUsers();
+    @Operation(summary = "Get All Users (Admin Only)", description = "List all registered users, optionally filtered by role and/or status")
+    public ResponseEntity<ApiResponse<List<UserDto>>> getAllUsers(
+            @RequestParam(required = false) Role role,
+            @RequestParam(required = false) UserStatus status) {
+        List<UserDto> users = authService.getAllUsers(role, status);
         return ResponseEntity.ok(ApiResponse.success("Users retrieved successfully", users));
     }
 

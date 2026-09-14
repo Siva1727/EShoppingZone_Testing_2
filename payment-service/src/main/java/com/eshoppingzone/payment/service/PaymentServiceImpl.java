@@ -176,6 +176,19 @@ public class PaymentServiceImpl implements PaymentService {
             throw new InvalidRefundException("Refund can only be requested for completed payments");
         }
 
+        // Verify that the order status is RETURNED
+        try {
+            ApiResponse<OrderDto> orderResponse = orderClient.getOrderInternal(request.getOrderId());
+            if (orderResponse == null || orderResponse.getData() == null || !"RETURNED".equalsIgnoreCase(orderResponse.getData().getStatus())) {
+                throw new InvalidRefundException("Refund can only be requested for returned orders");
+            }
+        } catch (InvalidRefundException ire) {
+            throw ire;
+        } catch (Exception e) {
+            log.error("Failed to verify order status for refund on order {}: {}", request.getOrderId(), e.getMessage());
+            throw new InvalidRefundException("Refund can only be requested for returned orders");
+        }
+
         String refNum = "REF-" + UUID.randomUUID().toString().substring(0, 10).toUpperCase();
         Refund refund = new Refund();
         refund.setPaymentId(payment.getId());

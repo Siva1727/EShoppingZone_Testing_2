@@ -200,8 +200,19 @@ public class AuthServiceImpl implements AuthService {
 
     @Override
     @Transactional(readOnly = true)
-    public List<UserDto> getAllUsers() {
-        return userRepository.findAll().stream()
+    public List<UserDto> getAllUsers(Role role, UserStatus status) {
+        List<User> users;
+        if (role != null && status != null) {
+            users = userRepository.findByRoleAndStatus(role, status);
+        } else if (role != null) {
+            users = userRepository.findByRole(role);
+        } else if (status != null) {
+            users = userRepository.findByStatus(status);
+        } else {
+            users = userRepository.findAll();
+        }
+
+        return users.stream()
                 .map(UserDto::fromEntity)
                 .collect(Collectors.toList());
     }

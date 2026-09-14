@@ -2,6 +2,7 @@ package com.eshoppingzone.auth.dto;
 
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 public class RegisterRequest {
@@ -21,6 +22,7 @@ public class RegisterRequest {
     @NotBlank(message = "Full name is required")
     private String fullName;
 
+    @Pattern(regexp = "^[0-9]{10}$", message = "Phone number must be a valid 10-digit number")
     private String phoneNumber;
 
     public RegisterRequest() {

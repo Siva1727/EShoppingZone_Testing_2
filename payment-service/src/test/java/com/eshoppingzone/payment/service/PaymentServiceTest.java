@@ -141,10 +141,11 @@ public class PaymentServiceTest {
     }
 
     @Test
-    void testRequestRefundSuccess() {
+    void testRequestRefundSuccessWhenOrderReturned() {
         RefundRequest request = new RefundRequest(100L, new BigDecimal("250.00"), "Product broken");
 
         when(paymentRepository.findByOrderId(100L)).thenReturn(Optional.of(mockPayment));
+        when(orderClient.getOrderInternal(100L)).thenReturn(ApiResponse.success("Order retrieved", new OrderDto(100L, "RETURNED")));
         when(refundRepository.save(any(Refund.class))).thenAnswer(i -> {
             Refund r = i.getArgument(0);
             r.setId(10L);
@@ -156,6 +157,43 @@ public class PaymentServiceTest {
         assertNotNull(result);
         assertEquals(RefundStatus.PENDING, result.getStatus());
         assertEquals(new BigDecimal("250.00"), result.getAmount());
+    }
+
+    @Test
+    void testRequestRefundRejectedWhenOrderConfirmed() {
+        RefundRequest request = new RefundRequest(100L, new BigDecimal("250.00"), "Product broken");
+
+        when(paymentRepository.findByOrderId(100L)).thenReturn(Optional.of(mockPayment));
+        when(orderClient.getOrderInternal(100L)).thenReturn(ApiResponse.success("Order retrieved", new OrderDto(100L, "CONFIRMED")));
+
+        InvalidRefundException ex = assertThrows(InvalidRefundException.class, () -> paymentService.requestRefund(4L, request));
+        assertEquals("Refund can only be requested for returned orders", ex.getMessage());
+        verify(refundRepository, never()).save(any(Refund.class));
+    }
+
+    @Test
+    void testRequestRefundRejectedWhenOrderProcessing() {
+        RefundRequest request = new RefundRequest(100L, new BigDecimal("250.00"), "Product broken");
+
+        when(paymentRepository.findByOrderId(100L)).thenReturn(Optional.of(mockPayment));
+        when(orderClient.getOrderInternal(100L)).thenReturn(ApiResponse.success("Order retrieved", new OrderDto(100L, "PROCESSING")));
+
+        InvalidRefundException ex = assertThrows(InvalidRefundException.class, () -> paymentService.requestRefund(4L, request));
+        assertEquals("Refund can only be requested for returned orders", ex.getMessage());
+        verify(refundRepository, never()).save(any(Refund.class));
+    }
+
+    @Test
+    void testRequestRefundRejectedWhenPaymentNotSuccess() {
+        RefundRequest request = new RefundRequest(100L, new BigDecimal("250.00"), "Product broken");
+        Payment pendingPayment = new Payment(1L, 100L, 4L, new BigDecimal("250.00"), PaymentMethod.COD, PaymentStatus.PENDING, "TXN-12345");
+
+        when(paymentRepository.findByOrderId(100L)).thenReturn(Optional.of(pendingPayment));
+
+        InvalidRefundException ex = assertThrows(InvalidRefundException.class, () -> paymentService.requestRefund(4L, request));
+        assertEquals("Refund can only be requested for completed payments", ex.getMessage());
+        verifyNoInteractions(orderClient);
+        verify(refundRepository, never()).save(any(Refund.class));
     }
 
     @Test

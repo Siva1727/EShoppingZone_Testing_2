@@ -21,6 +21,7 @@ import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -141,5 +142,91 @@ class AuthServiceTest {
 
         assertThrows(InvalidTokenException.class, () -> authService.resetPassword(request));
         verify(userRepository, never()).save(any(User.class));
+    }
+
+    @Test
+    void testGetAllUsersNoFiltersReturnsAllUsers() {
+        User merchant = new User(2L, "merchant1", "m1@example.com", "pass", "Merchant One", "1111111111", Role.MERCHANT, UserStatus.ACTIVE);
+        when(userRepository.findAll()).thenReturn(List.of(sampleUser, merchant));
+
+        List<UserDto> result = authService.getAllUsers(null, null);
+
+        assertNotNull(result);
+        assertEquals(2, result.size());
+        verify(userRepository, times(1)).findAll();
+        verify(userRepository, never()).findByRole(any());
+        verify(userRepository, never()).findByStatus(any());
+        verify(userRepository, never()).findByRoleAndStatus(any(), any());
+    }
+
+    @Test
+    void testGetAllUsersRoleFilterOnly() {
+        User merchant = new User(2L, "merchant1", "m1@example.com", "pass", "Merchant One", "1111111111", Role.MERCHANT, UserStatus.ACTIVE);
+        when(userRepository.findByRole(Role.MERCHANT)).thenReturn(List.of(merchant));
+
+        List<UserDto> result = authService.getAllUsers(Role.MERCHANT, null);
+
+        assertNotNull(result);
+        assertEquals(1, result.size());
+        assertEquals("merchant1", result.get(0).getUsername());
+        assertEquals(Role.MERCHANT, result.get(0).getRole());
+        verify(userRepository, times(1)).findByRole(Role.MERCHANT);
+        verify(userRepository, never()).findAll();
+    }
+
+    @Test
+    void testGetAllUsersStatusFilterOnly() {
+        User inactiveUser = new User(3L, "inactiveUser", "in@example.com", "pass", "Inactive User", "2222222222", Role.CUSTOMER, UserStatus.INACTIVE);
+        when(userRepository.findByStatus(UserStatus.INACTIVE)).thenReturn(List.of(inactiveUser));
+
+        List<UserDto> result = authService.getAllUsers(null, UserStatus.INACTIVE);
+
+        assertNotNull(result);
+        assertEquals(1, result.size());
+        assertEquals("inactiveUser", result.get(0).getUsername());
+        assertEquals(UserStatus.INACTIVE, result.get(0).getStatus());
+        verify(userRepository, times(1)).findByStatus(UserStatus.INACTIVE);
+        verify(userRepository, never()).findAll();
+    }
+
+    @Test
+    void testGetAllUsersRoleAndStatusFilter() {
+        User activeMerchant = new User(2L, "merchant1", "m1@example.com", "pass", "Merchant One", "1111111111", Role.MERCHANT, UserStatus.ACTIVE);
+        when(userRepository.findByRoleAndStatus(Role.MERCHANT, UserStatus.ACTIVE)).thenReturn(List.of(activeMerchant));
+
+        List<UserDto> result = authService.getAllUsers(Role.MERCHANT, UserStatus.ACTIVE);
+
+        assertNotNull(result);
+        assertEquals(1, result.size());
+        assertEquals("merchant1", result.get(0).getUsername());
+        assertEquals(Role.MERCHANT, result.get(0).getRole());
+        assertEquals(UserStatus.ACTIVE, result.get(0).getStatus());
+        verify(userRepository, times(1)).findByRoleAndStatus(Role.MERCHANT, UserStatus.ACTIVE);
+        verify(userRepository, never()).findAll();
+        verify(userRepository, never()).findByRole(any());
+        verify(userRepository, never()).findByStatus(any());
+    }
+
+    @Test
+    void testGetUserByIdSuccess() {
+        when(userRepository.findById(1L)).thenReturn(Optional.of(sampleUser));
+
+        UserDto result = authService.getUserById(1L);
+
+        assertNotNull(result);
+        assertEquals("testuser", result.getUsername());
+        verify(userRepository, times(1)).findById(1L);
+    }
+
+    @Test
+    void testUpdateUserStatusSuccess() {
+        when(userRepository.findById(1L)).thenReturn(Optional.of(sampleUser));
+        when(userRepository.save(any(User.class))).thenReturn(sampleUser);
+
+        UserDto result = authService.updateUserStatus(1L, UserStatus.BLOCKED);
+
+        assertNotNull(result);
+        assertEquals(UserStatus.BLOCKED, sampleUser.getStatus());
+        verify(userRepository, times(1)).save(sampleUser);
     }
 }
