@@ -3,15 +3,21 @@ package com.eshoppingzone.notification.config;
 import org.springframework.amqp.core.*;
 import org.springframework.amqp.rabbit.connection.ConnectionFactory;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.amqp.rabbit.listener.SimpleRabbitListenerContainerFactory;
+import org.springframework.amqp.rabbit.retry.RepublishMessageRecoverer;
 import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
 import org.springframework.amqp.support.converter.MessageConverter;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.retry.interceptor.RetryInterceptorBuilder;
 
 @Configuration
 public class RabbitMQConfig {
 
     public static final String EXCHANGE = "eshoppingzone.exchange";
+    public static final String DLX = "eshoppingzone.dlx";
+    public static final String DLQ = "eshoppingzone.dlq";
+    public static final String DLQ_ROUTING_KEY = "failed";
 
     public static final String QUEUE_USER_NOTIFICATIONS = "notification.user.queue";
     public static final String QUEUE_ORDER_NOTIFICATIONS = "notification.order.queue";
@@ -27,6 +33,21 @@ public class RabbitMQConfig {
     @Bean
     public TopicExchange exchange() {
         return new TopicExchange(EXCHANGE);
+    }
+
+    @Bean
+    public DirectExchange deadLetterExchange() {
+        return new DirectExchange(DLX);
+    }
+
+    @Bean
+    public Queue deadLetterQueue() {
+        return new Queue(DLQ, true);
+    }
+
+    @Bean
+    public Binding deadLetterBinding(Queue deadLetterQueue, DirectExchange deadLetterExchange) {
+        return BindingBuilder.bind(deadLetterQueue).to(deadLetterExchange).with(DLQ_ROUTING_KEY);
     }
 
     @Bean
@@ -84,5 +105,20 @@ public class RabbitMQConfig {
         RabbitTemplate rabbitTemplate = new RabbitTemplate(connectionFactory);
         rabbitTemplate.setMessageConverter(jsonMessageConverter());
         return rabbitTemplate;
+    }
+
+    @Bean
+    public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
+            ConnectionFactory connectionFactory, RabbitTemplate rabbitTemplate) {
+        SimpleRabbitListenerContainerFactory factory = new SimpleRabbitListenerContainerFactory();
+        factory.setConnectionFactory(connectionFactory);
+        factory.setMessageConverter(jsonMessageConverter());
+        factory.setDefaultRequeueRejected(false);
+        factory.setAdviceChain(RetryInterceptorBuilder.stateless()
+                .maxAttempts(3)
+                .backOffOptions(1000, 2.0, 10000)
+                .recoverer(new RepublishMessageRecoverer(rabbitTemplate, DLX, DLQ_ROUTING_KEY))
+                .build());
+        return factory;
     }
 }
