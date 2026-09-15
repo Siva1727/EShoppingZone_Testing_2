@@ -14,7 +14,7 @@ import org.testcontainers.utility.DockerImageName;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-@Testcontainers
+@Testcontainers(disabledWithoutDocker = true)
 class RabbitMqDeadLetterIT {
 
     @Container

@@ -8,6 +8,7 @@ import java.util.List;
 
 public interface OrderService {
     OrderDto checkout(Long customerId, CheckoutRequest request);
+    OrderDto checkout(Long customerId, CheckoutRequest request, String idempotencyKey);
     List<OrderDto> getCustomerOrders(Long customerId);
     OrderDto getOrderById(Long orderId, Long customerId);
     OrderDto cancelOrder(Long orderId, Long customerId, String reason);

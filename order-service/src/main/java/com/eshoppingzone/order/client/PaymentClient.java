@@ -12,4 +12,7 @@ public interface PaymentClient {
 
     @PostMapping("/api/v1/payments/process")
     ApiResponse<PaymentResponseDto> processPayment(@RequestBody ProcessPaymentRequest request);
+
+    @org.springframework.web.bind.annotation.GetMapping("/api/v1/payments/order/{orderId}")
+    ApiResponse<PaymentResponseDto> getPaymentByOrderId(@org.springframework.web.bind.annotation.PathVariable("orderId") Long orderId);
 }

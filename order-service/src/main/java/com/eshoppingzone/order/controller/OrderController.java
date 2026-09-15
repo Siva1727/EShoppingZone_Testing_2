@@ -39,9 +39,10 @@ public class OrderController {
     @Operation(summary = "Checkout and Place Order", description = "Places order from customer cart, reserves inventory, and processes payment (WALLET / COD)")
     @PreAuthorize("hasRole('CUSTOMER')")
     public ResponseEntity<ApiResponse<OrderDto>> checkout(Authentication authentication,
+                                                          @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
                                                           @Valid @RequestBody CheckoutRequest request) {
         Long customerId = getCustomerId(authentication);
-        OrderDto order = orderService.checkout(customerId, request);
+        OrderDto order = orderService.checkout(customerId, request, idempotencyKey);
         return new ResponseEntity<>(ApiResponse.success("Order placed successfully", order), HttpStatus.CREATED);
     }
 

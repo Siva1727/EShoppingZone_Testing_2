@@ -4,12 +4,19 @@ import com.eshoppingzone.order.client.*;
 import com.eshoppingzone.order.config.RabbitMQConfig;
 import com.eshoppingzone.order.dto.*;
 import com.eshoppingzone.order.entity.*;
+import com.eshoppingzone.order.exception.IdempotencyConflictException;
 import com.eshoppingzone.order.exception.InsufficientStockException;
 import com.eshoppingzone.order.exception.InvalidOrderStateException;
 import com.eshoppingzone.order.exception.PaymentException;
 import com.eshoppingzone.order.exception.ResourceNotFoundException;
 import com.eshoppingzone.order.repository.OrderItemRepository;
 import com.eshoppingzone.order.repository.OrderRepository;
+import com.eshoppingzone.order.saga.entity.OrderSagaState;
+import com.eshoppingzone.order.saga.entity.SagaStatus;
+import com.eshoppingzone.order.saga.orchestrator.CheckoutSagaContext;
+import com.eshoppingzone.order.saga.orchestrator.CheckoutSagaOrchestrator;
+import com.eshoppingzone.order.saga.orchestrator.SagaStateService;
+import com.eshoppingzone.order.saga.util.RequestFingerprintUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
@@ -19,6 +26,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -35,6 +43,8 @@ public class OrderServiceImpl implements OrderService {
     private final PaymentClient paymentClient;
     private final ProfileClient profileClient;
     private final RabbitTemplate rabbitTemplate;
+    private final CheckoutSagaOrchestrator checkoutSagaOrchestrator;
+    private final SagaStateService sagaStateService;
 
     public OrderServiceImpl(OrderRepository orderRepository,
                             OrderItemRepository orderItemRepository,
@@ -43,7 +53,9 @@ public class OrderServiceImpl implements OrderService {
                             InventoryClient inventoryClient,
                             PaymentClient paymentClient,
                             ProfileClient profileClient,
-                            RabbitTemplate rabbitTemplate) {
+                            RabbitTemplate rabbitTemplate,
+                            CheckoutSagaOrchestrator checkoutSagaOrchestrator,
+                            SagaStateService sagaStateService) {
         this.orderRepository = orderRepository;
         this.orderItemRepository = orderItemRepository;
         this.cartClient = cartClient;
@@ -52,14 +64,26 @@ public class OrderServiceImpl implements OrderService {
         this.paymentClient = paymentClient;
         this.profileClient = profileClient;
         this.rabbitTemplate = rabbitTemplate;
+        this.checkoutSagaOrchestrator = checkoutSagaOrchestrator;
+        this.sagaStateService = sagaStateService;
     }
 
     @Override
-    @Transactional
     public OrderDto checkout(Long customerId, CheckoutRequest request) {
-        log.info("Starting checkout for customer ID: {}, PaymentMethod: {}", customerId, request.getPaymentMethod());
+        return checkout(customerId, request, null);
+    }
 
-        // 1. Fetch items from Customer's Cart
+    @Override
+    public OrderDto checkout(Long customerId, CheckoutRequest request, String idempotencyKey) {
+        log.info("Starting checkout for customer ID: {}, PaymentMethod: {}, IdempotencyKey: {}",
+                customerId, request.getPaymentMethod(), idempotencyKey);
+
+        // 1. Idempotency Key Handling
+        String effectiveIdempotencyKey = (idempotencyKey != null && !idempotencyKey.isBlank())
+                ? idempotencyKey.trim()
+                : UUID.randomUUID().toString();
+
+        // 2. Fetch items from Customer's Cart
         ApiResponse<CartDto> cartResponse = cartClient.getCartByCustomerId(customerId);
         if (cartResponse == null || cartResponse.getData() == null || cartResponse.getData().getItems().isEmpty()) {
             throw new InvalidOrderStateException("Shopping cart is empty. Cannot place order.");
@@ -68,7 +92,16 @@ public class OrderServiceImpl implements OrderService {
         CartDto cart = cartResponse.getData();
         List<CartItemDto> cartItems = cart.getItems();
 
-        // 2. Fetch shipping address
+        // 3. Compute deterministic request fingerprint
+        String requestFingerprint = RequestFingerprintUtil.computeFingerprint(customerId, cartItems, request);
+
+        // 4. Check if Saga already exists for this idempotency key
+        Optional<OrderSagaState> existingSagaOpt = sagaStateService.findByIdempotencyKey(effectiveIdempotencyKey);
+        if (existingSagaOpt.isPresent()) {
+            return handleExistingSaga(existingSagaOpt.get(), customerId, requestFingerprint);
+        }
+
+        // 3. Fetch shipping address
         String street = request.getShippingStreet();
         String city = request.getShippingCity();
         String state = request.getShippingState();
@@ -99,7 +132,7 @@ public class OrderServiceImpl implements OrderService {
             country = "Country";
         }
 
-        // 3. Create initial Order
+        // 4. Create initial Order entity in PENDING_PAYMENT
         String orderNumber = "ORD-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
         Order order = new Order();
         order.setOrderNumber(orderNumber);
@@ -120,7 +153,6 @@ public class OrderServiceImpl implements OrderService {
         List<StockReservationItem> reservationItems = new ArrayList<>();
 
         for (CartItemDto cartItem : cartItems) {
-            // Fetch live product info for merchant and snapshot
             String productName = cartItem.getProductName();
             BigDecimal unitPrice = cartItem.getUnitPrice();
             try {
@@ -157,113 +189,41 @@ public class OrderServiceImpl implements OrderService {
 
         Order savedOrder = orderRepository.save(order);
 
-        // 4. Reserve stock in Inventory Service
-        StockReservationRequest stockReq = new StockReservationRequest(orderNumber, reservationItems);
-        try {
-            ApiResponse<Void> stockRes = inventoryClient.reserveStock(stockReq);
-            if (stockRes != null && !stockRes.isSuccess()) {
-                savedOrder.setStatus(OrderStatus.FAILED);
-                orderRepository.save(savedOrder);
-                throw new InsufficientStockException("Inventory reservation failed for order items.");
-            }
-        } catch (Exception e) {
-            savedOrder.setStatus(OrderStatus.FAILED);
-            orderRepository.save(savedOrder);
-            throw new InsufficientStockException("Failed to reserve inventory: " + e.getMessage());
+        // 5. Construct Saga Context and execute Checkout Saga Orchestration
+        String sagaId = "SAGA-" + orderNumber + "-" + UUID.randomUUID().toString().substring(0, 6).toUpperCase();
+        CheckoutSagaContext context = new CheckoutSagaContext(
+                sagaId,
+                effectiveIdempotencyKey,
+                requestFingerprint,
+                customerId,
+                savedOrder,
+                reservationItems,
+                request
+        );
+
+        return checkoutSagaOrchestrator.executeSaga(context);
+    }
+
+    private OrderDto handleExistingSaga(OrderSagaState existingSaga, Long customerId, String requestFingerprint) {
+        if (!existingSaga.getCustomerId().equals(customerId)) {
+            throw new InvalidOrderStateException("Idempotency key belongs to another customer or request");
         }
-
-        // 5. Process Payment
-        if (request.getPaymentMethod() == PaymentMethod.WALLET) {
-            ProcessPaymentRequest payReq = new ProcessPaymentRequest(
-                    savedOrder.getId(),
-                    customerId,
-                    totalAmount,
-                    PaymentMethod.WALLET
-            );
-
-            boolean paymentSuccess = false;
-            try {
-                ApiResponse<PaymentResponseDto> payRes = paymentClient.processPayment(payReq);
-                if (payRes != null && payRes.isSuccess() && payRes.getData() != null && "SUCCESS".equalsIgnoreCase(payRes.getData().getStatus())) {
-                    paymentSuccess = true;
-                }
-            } catch (Exception e) {
-                log.error("Payment processing error: {}", e.getMessage());
-            }
-
-            if (paymentSuccess) {
-                savedOrder.setStatus(OrderStatus.CONFIRMED);
-                savedOrder.setPaymentStatus(PaymentStatus.SUCCESS);
-                orderRepository.save(savedOrder);
-
-                // Confirm stock consumption
-                try {
-                    inventoryClient.confirmStock(stockReq);
-                } catch (Exception e) {
-                    log.warn("Failed to confirm stock consumption: {}", e.getMessage());
-                }
-
-                // Clear customer cart
-                try {
-                    cartClient.clearCustomerCart(customerId);
-                } catch (Exception e) {
-                    log.warn("Failed to clear cart: {}", e.getMessage());
-                }
-
-                // Publish RabbitMQ events
-                publishOrderEvent(savedOrder, "ORDER_CONFIRMED", RabbitMQConfig.ORDER_CONFIRMED_ROUTING_KEY);
-            } else {
-                // Payment failed -> release reserved stock and mark order FAILED
-                savedOrder.setStatus(OrderStatus.FAILED);
-                savedOrder.setPaymentStatus(PaymentStatus.FAILED);
-                orderRepository.save(savedOrder);
-
-                try {
-                    inventoryClient.releaseStock(stockReq);
-                } catch (Exception e) {
-                    log.warn("Failed to release stock after payment failure: {}", e.getMessage());
-                }
-
-                publishOrderEvent(savedOrder, "ORDER_FAILED", RabbitMQConfig.ORDER_STATUS_ROUTING_KEY);
-                throw new PaymentException("Payment failed. Insufficient wallet balance or payment error.");
-            }
-        } else if (request.getPaymentMethod() == PaymentMethod.COD) {
-            // Cash on Delivery -> Order is confirmed, payment status remains PENDING until delivery
-            savedOrder.setStatus(OrderStatus.CONFIRMED);
-            savedOrder.setPaymentStatus(PaymentStatus.PENDING);
-            orderRepository.save(savedOrder);
-
-            // Initialize COD Payment record in Payment Service
-            try {
-                ProcessPaymentRequest payReq = new ProcessPaymentRequest(
-                        savedOrder.getId(),
-                        customerId,
-                        totalAmount,
-                        PaymentMethod.COD
-                );
-                paymentClient.processPayment(payReq);
-            } catch (Exception e) {
-                log.warn("Failed to initialize COD payment in Payment Service: {}", e.getMessage());
-            }
-
-            // Confirm stock consumption for COD
-            try {
-                inventoryClient.confirmStock(stockReq);
-            } catch (Exception e) {
-                log.warn("Failed to confirm stock for COD order: {}", e.getMessage());
-            }
-
-            // Clear customer cart
-            try {
-                cartClient.clearCustomerCart(customerId);
-            } catch (Exception e) {
-                log.warn("Failed to clear cart: {}", e.getMessage());
-            }
-
-            publishOrderEvent(savedOrder, "ORDER_CONFIRMED", RabbitMQConfig.ORDER_CONFIRMED_ROUTING_KEY);
+        if (existingSaga.getRequestFingerprint() != null && !existingSaga.getRequestFingerprint().equals(requestFingerprint)) {
+            throw new IdempotencyConflictException("Idempotency key reused with different checkout request parameters");
         }
-
-        return OrderDto.fromEntity(savedOrder);
+        if (existingSaga.getStatus() == SagaStatus.COMPLETED || existingSaga.getStatus() == SagaStatus.INVENTORY_CONFIRMED || existingSaga.getStatus() == SagaStatus.CART_CLEARED) {
+            log.info("Idempotent checkout request: returning already COMPLETED order ID: {}", existingSaga.getOrderId());
+            Order completedOrder = orderRepository.findById(existingSaga.getOrderId())
+                    .orElseThrow(() -> new ResourceNotFoundException("Order not found with id: " + existingSaga.getOrderId()));
+            return OrderDto.fromEntity(completedOrder);
+        } else if (existingSaga.getStatus() == SagaStatus.FAILED) {
+            throw new PaymentException("Previous checkout with this idempotency key failed: " + existingSaga.getFailureReason());
+        } else {
+            // Saga is currently in flight or in reconciliation
+            Order inFlightOrder = orderRepository.findById(existingSaga.getOrderId())
+                    .orElseThrow(() -> new ResourceNotFoundException("Order not found with id: " + existingSaga.getOrderId()));
+            return OrderDto.fromEntity(inFlightOrder);
+        }
     }
 
     @Override

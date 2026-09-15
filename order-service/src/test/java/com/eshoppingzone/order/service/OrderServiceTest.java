@@ -3,10 +3,18 @@ package com.eshoppingzone.order.service;
 import com.eshoppingzone.order.client.*;
 import com.eshoppingzone.order.dto.*;
 import com.eshoppingzone.order.entity.*;
-import com.eshoppingzone.order.exception.InsufficientStockException;
+import com.eshoppingzone.order.exception.IdempotencyConflictException;
 import com.eshoppingzone.order.exception.InvalidOrderStateException;
+import com.eshoppingzone.order.exception.PaymentException;
 import com.eshoppingzone.order.repository.OrderItemRepository;
 import com.eshoppingzone.order.repository.OrderRepository;
+import com.eshoppingzone.order.saga.entity.OrderSagaState;
+import com.eshoppingzone.order.saga.entity.SagaStatus;
+import com.eshoppingzone.order.saga.entity.SagaStep;
+import com.eshoppingzone.order.saga.orchestrator.CheckoutSagaContext;
+import com.eshoppingzone.order.saga.orchestrator.CheckoutSagaOrchestrator;
+import com.eshoppingzone.order.saga.orchestrator.SagaStateService;
+import com.eshoppingzone.order.saga.util.RequestFingerprintUtil;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -51,6 +59,12 @@ class OrderServiceTest {
     @Mock
     private RabbitTemplate rabbitTemplate;
 
+    @Mock
+    private CheckoutSagaOrchestrator checkoutSagaOrchestrator;
+
+    @Mock
+    private SagaStateService sagaStateService;
+
     @InjectMocks
     private OrderServiceImpl orderService;
 
@@ -58,59 +72,160 @@ class OrderServiceTest {
 
     @BeforeEach
     void setUp() {
-        sampleOrder = new Order(1L, "ORD-12345678", 100L, 2L, new BigDecimal("100.00"), OrderStatus.CONFIRMED, PaymentMethod.WALLET, PaymentStatus.SUCCESS);
+        sampleOrder = new Order(1L, "ORD-12345678", 100L, 2L, new BigDecimal("100.00"),
+                OrderStatus.CONFIRMED, PaymentMethod.WALLET, PaymentStatus.SUCCESS);
         sampleOrder.setItems(new ArrayList<>());
     }
 
     @Test
-    void testCheckoutSuccess() {
+    void testCheckoutDelegatesToSagaOrchestrator() {
         CheckoutRequest request = new CheckoutRequest(null, PaymentMethod.WALLET);
         CartItemDto cartItem = new CartItemDto(1L, 1L, "Item", new BigDecimal("50.00"), 2, new BigDecimal("100.00"));
         CartDto cartDto = new CartDto(1L, 100L, List.of(cartItem), 2, new BigDecimal("100.00"));
-
         ProductSnapshotDto productSnapshot = new ProductSnapshotDto(1L, 2L, "Item", new BigDecimal("50.00"), "ACTIVE");
-        PaymentResponseDto paymentResponse = new PaymentResponseDto(1L, 1L, 100L, new BigDecimal("100.00"), "WALLET", "SUCCESS", "TXN-1", null);
 
+        when(sagaStateService.findByIdempotencyKey(any())).thenReturn(Optional.empty());
         when(cartClient.getCartByCustomerId(100L)).thenReturn(ApiResponse.success(cartDto));
         when(productClient.getProductById(1L)).thenReturn(ApiResponse.success(productSnapshot));
         when(orderRepository.save(any(Order.class))).thenReturn(sampleOrder);
-        when(inventoryClient.reserveStock(any(StockReservationRequest.class))).thenReturn(ApiResponse.success(null));
-        when(paymentClient.processPayment(any(ProcessPaymentRequest.class))).thenReturn(ApiResponse.success(paymentResponse));
+        when(checkoutSagaOrchestrator.executeSaga(any(CheckoutSagaContext.class)))
+                .thenReturn(OrderDto.fromEntity(sampleOrder));
 
         OrderDto result = orderService.checkout(100L, request);
 
         assertNotNull(result);
         assertEquals(OrderStatus.CONFIRMED, result.getStatus());
-        verify(inventoryClient, times(1)).confirmStock(any());
-        verify(cartClient, times(1)).clearCustomerCart(100L);
+        verify(checkoutSagaOrchestrator, times(1)).executeSaga(any(CheckoutSagaContext.class));
     }
 
     @Test
-    void testCheckoutCodSuccess() {
-        CheckoutRequest request = new CheckoutRequest(null, PaymentMethod.COD);
+    void test1_SameKey_SameCustomer_SameRequest_ReturnsExistingOrder() {
+        CheckoutRequest request = new CheckoutRequest(null, PaymentMethod.WALLET);
+        String idempotencyKey = "IDEMP-ABC-123";
+        CartItemDto cartItem = new CartItemDto(1L, 1L, "Item", new BigDecimal("50.00"), 2, new BigDecimal("100.00"));
+        CartDto cartDto = new CartDto(1L, 100L, List.of(cartItem), 2, new BigDecimal("100.00"));
+        String expectedFingerprint = RequestFingerprintUtil.computeFingerprint(100L, List.of(cartItem), request);
+
+        OrderSagaState completedSaga = new OrderSagaState("SAGA-1", idempotencyKey, expectedFingerprint, 1L, "ORD-12345678",
+                100L, "WALLET", new BigDecimal("100.00"), SagaStep.FINALIZE_ORDER, SagaStatus.COMPLETED);
+
+        when(cartClient.getCartByCustomerId(100L)).thenReturn(ApiResponse.success(cartDto));
+        when(sagaStateService.findByIdempotencyKey(idempotencyKey)).thenReturn(Optional.of(completedSaga));
+        when(orderRepository.findById(1L)).thenReturn(Optional.of(sampleOrder));
+
+        OrderDto result = orderService.checkout(100L, request, idempotencyKey);
+
+        assertNotNull(result);
+        assertEquals("ORD-12345678", result.getOrderNumber());
+        // Verify no new order, no product fetch, no saga execution
+        verify(productClient, never()).getProductById(any());
+        verify(orderRepository, never()).save(any());
+        verify(checkoutSagaOrchestrator, never()).executeSaga(any());
+    }
+
+    @Test
+    void test2_SameKey_DifferentCustomer_ThrowsException() {
+        CheckoutRequest request = new CheckoutRequest(null, PaymentMethod.WALLET);
+        String idempotencyKey = "IDEMP-ABC-123";
         CartItemDto cartItem = new CartItemDto(1L, 1L, "Item", new BigDecimal("50.00"), 2, new BigDecimal("100.00"));
         CartDto cartDto = new CartDto(1L, 100L, List.of(cartItem), 2, new BigDecimal("100.00"));
 
-        ProductSnapshotDto productSnapshot = new ProductSnapshotDto(1L, 2L, "Item", new BigDecimal("50.00"), "ACTIVE");
-        PaymentResponseDto paymentResponse = new PaymentResponseDto(1L, 1L, 100L, new BigDecimal("100.00"), "COD", "PENDING", "TXN-COD-1", null);
+        // Saga was started by customer 200L, but customer 100L is calling with same key
+        OrderSagaState existingSaga = new OrderSagaState("SAGA-1", idempotencyKey, "FP-200", 1L, "ORD-12345678",
+                200L, "WALLET", new BigDecimal("100.00"), SagaStep.FINALIZE_ORDER, SagaStatus.COMPLETED);
 
         when(cartClient.getCartByCustomerId(100L)).thenReturn(ApiResponse.success(cartDto));
-        when(productClient.getProductById(1L)).thenReturn(ApiResponse.success(productSnapshot));
-        Order codOrder = new Order(1L, "ORD-12345678", 100L, 2L, new BigDecimal("100.00"), OrderStatus.CONFIRMED, PaymentMethod.COD, PaymentStatus.PENDING);
-        codOrder.setItems(new ArrayList<>());
-        when(orderRepository.save(any(Order.class))).thenReturn(codOrder);
-        when(inventoryClient.reserveStock(any(StockReservationRequest.class))).thenReturn(ApiResponse.success(null));
-        when(paymentClient.processPayment(any(ProcessPaymentRequest.class))).thenReturn(ApiResponse.success(paymentResponse));
+        when(sagaStateService.findByIdempotencyKey(idempotencyKey)).thenReturn(Optional.of(existingSaga));
 
-        OrderDto result = orderService.checkout(100L, request);
+        assertThrows(InvalidOrderStateException.class, () ->
+                orderService.checkout(100L, request, idempotencyKey));
+        verify(checkoutSagaOrchestrator, never()).executeSaga(any());
+    }
+
+    @Test
+    void test3_SameKey_SameCustomer_DifferentCart_ThrowsConflictException() {
+        CheckoutRequest request = new CheckoutRequest(null, PaymentMethod.WALLET);
+        String idempotencyKey = "IDEMP-ABC-123";
+        CartItemDto originalItem = new CartItemDto(1L, 1L, "Item 1", new BigDecimal("50.00"), 1, new BigDecimal("50.00"));
+        String originalFingerprint = RequestFingerprintUtil.computeFingerprint(100L, List.of(originalItem), request);
+
+        OrderSagaState existingSaga = new OrderSagaState("SAGA-1", idempotencyKey, originalFingerprint, 1L, "ORD-12345678",
+                100L, "WALLET", new BigDecimal("50.00"), SagaStep.FINALIZE_ORDER, SagaStatus.COMPLETED);
+
+        // Current cart has changed to Item 2
+        CartItemDto changedItem = new CartItemDto(2L, 2L, "Item 2", new BigDecimal("70.00"), 1, new BigDecimal("70.00"));
+        CartDto currentCart = new CartDto(1L, 100L, List.of(changedItem), 1, new BigDecimal("70.00"));
+
+        when(cartClient.getCartByCustomerId(100L)).thenReturn(ApiResponse.success(currentCart));
+        when(sagaStateService.findByIdempotencyKey(idempotencyKey)).thenReturn(Optional.of(existingSaga));
+
+        assertThrows(IdempotencyConflictException.class, () ->
+                orderService.checkout(100L, request, idempotencyKey));
+        verify(checkoutSagaOrchestrator, never()).executeSaga(any());
+    }
+
+    @Test
+    void test4_SameKey_SameCustomer_DifferentPaymentMethod_ThrowsConflictException() {
+        CheckoutRequest originalRequest = new CheckoutRequest(null, PaymentMethod.WALLET);
+        String idempotencyKey = "IDEMP-ABC-123";
+        CartItemDto item = new CartItemDto(1L, 1L, "Item 1", new BigDecimal("50.00"), 1, new BigDecimal("50.00"));
+        String originalFingerprint = RequestFingerprintUtil.computeFingerprint(100L, List.of(item), originalRequest);
+
+        OrderSagaState existingSaga = new OrderSagaState("SAGA-1", idempotencyKey, originalFingerprint, 1L, "ORD-12345678",
+                100L, "WALLET", new BigDecimal("50.00"), SagaStep.FINALIZE_ORDER, SagaStatus.COMPLETED);
+
+        // Same cart, but payment method changed to COD
+        CheckoutRequest newRequest = new CheckoutRequest(null, PaymentMethod.COD);
+        CartDto currentCart = new CartDto(1L, 100L, List.of(item), 1, new BigDecimal("50.00"));
+
+        when(cartClient.getCartByCustomerId(100L)).thenReturn(ApiResponse.success(currentCart));
+        when(sagaStateService.findByIdempotencyKey(idempotencyKey)).thenReturn(Optional.of(existingSaga));
+
+        assertThrows(IdempotencyConflictException.class, () ->
+                orderService.checkout(100L, newRequest, idempotencyKey));
+        verify(checkoutSagaOrchestrator, never()).executeSaga(any());
+    }
+
+    @Test
+    void test5_SameKey_SameCustomer_DifferentShippingAddress_ThrowsConflictException() {
+        CheckoutRequest originalRequest = new CheckoutRequest(1L, PaymentMethod.WALLET);
+        String idempotencyKey = "IDEMP-ABC-123";
+        CartItemDto item = new CartItemDto(1L, 1L, "Item 1", new BigDecimal("50.00"), 1, new BigDecimal("50.00"));
+        String originalFingerprint = RequestFingerprintUtil.computeFingerprint(100L, List.of(item), originalRequest);
+
+        OrderSagaState existingSaga = new OrderSagaState("SAGA-1", idempotencyKey, originalFingerprint, 1L, "ORD-12345678",
+                100L, "WALLET", new BigDecimal("50.00"), SagaStep.FINALIZE_ORDER, SagaStatus.COMPLETED);
+
+        // Address changed to addressId 2L
+        CheckoutRequest newRequest = new CheckoutRequest(2L, PaymentMethod.WALLET);
+        CartDto currentCart = new CartDto(1L, 100L, List.of(item), 1, new BigDecimal("50.00"));
+
+        when(cartClient.getCartByCustomerId(100L)).thenReturn(ApiResponse.success(currentCart));
+        when(sagaStateService.findByIdempotencyKey(idempotencyKey)).thenReturn(Optional.of(existingSaga));
+
+        assertThrows(IdempotencyConflictException.class, () ->
+                orderService.checkout(100L, newRequest, idempotencyKey));
+        verify(checkoutSagaOrchestrator, never()).executeSaga(any());
+    }
+
+    @Test
+    void test6_NoIdempotencyKey_GeneratesFreshUUID_ExecutesIndependentSaga() {
+        CheckoutRequest request = new CheckoutRequest(null, PaymentMethod.WALLET);
+        CartItemDto cartItem = new CartItemDto(1L, 1L, "Item", new BigDecimal("50.00"), 2, new BigDecimal("100.00"));
+        CartDto cartDto = new CartDto(1L, 100L, List.of(cartItem), 2, new BigDecimal("100.00"));
+        ProductSnapshotDto productSnapshot = new ProductSnapshotDto(1L, 2L, "Item", new BigDecimal("50.00"), "ACTIVE");
+
+        when(cartClient.getCartByCustomerId(100L)).thenReturn(ApiResponse.success(cartDto));
+        when(sagaStateService.findByIdempotencyKey(any())).thenReturn(Optional.empty());
+        when(productClient.getProductById(1L)).thenReturn(ApiResponse.success(productSnapshot));
+        when(orderRepository.save(any(Order.class))).thenReturn(sampleOrder);
+        when(checkoutSagaOrchestrator.executeSaga(any(CheckoutSagaContext.class)))
+                .thenReturn(OrderDto.fromEntity(sampleOrder));
+
+        OrderDto result = orderService.checkout(100L, request, null);
 
         assertNotNull(result);
-        assertEquals(OrderStatus.CONFIRMED, result.getStatus());
-        assertEquals(PaymentStatus.PENDING, result.getPaymentStatus());
-        assertEquals(PaymentMethod.COD, result.getPaymentMethod());
-        verify(paymentClient, times(1)).processPayment(any(ProcessPaymentRequest.class));
-        verify(inventoryClient, times(1)).confirmStock(any());
-        verify(cartClient, times(1)).clearCustomerCart(100L);
+        verify(checkoutSagaOrchestrator, times(1)).executeSaga(any(CheckoutSagaContext.class));
     }
 
     @Test
@@ -142,5 +257,29 @@ class OrderServiceTest {
         OrderDto result = orderService.processMerchantOrder(1L, 2L);
 
         assertEquals(OrderStatus.PROCESSING, result.getStatus());
+    }
+
+    @Test
+    void testReadyForDeliverySuccess() {
+        sampleOrder.setStatus(OrderStatus.PROCESSING);
+        when(orderRepository.findByIdAndMerchantId(1L, 2L)).thenReturn(Optional.of(sampleOrder));
+        when(orderRepository.save(any(Order.class))).thenReturn(sampleOrder);
+
+        OrderDto result = orderService.readyForDelivery(1L, 2L);
+
+        assertEquals(OrderStatus.READY_FOR_DELIVERY, result.getStatus());
+    }
+
+    @Test
+    void testRejectMerchantOrderSuccess() {
+        sampleOrder.setStatus(OrderStatus.CONFIRMED);
+        when(orderRepository.findByIdAndMerchantId(1L, 2L)).thenReturn(Optional.of(sampleOrder));
+        when(orderRepository.save(any(Order.class))).thenReturn(sampleOrder);
+        when(inventoryClient.releaseStock(any())).thenReturn(ApiResponse.success(null));
+
+        OrderDto result = orderService.rejectMerchantOrder(1L, 2L, "Out of stock");
+
+        assertEquals(OrderStatus.CANCELLED, result.getStatus());
+        verify(inventoryClient, times(1)).releaseStock(any());
     }
 }
