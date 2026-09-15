@@ -61,8 +61,37 @@ The default local endpoints are:
 Start the parent build from the repository root:
 
 ```bash
-mvn clean verify
+./mvnw clean verify
 ```
+
+On Windows, use `mvnw.cmd clean verify`. The Maven Wrapper downloads Maven 3.9.9 into `.mvn/wrapper/dists` on first use.
+
+Every push and pull request targeting `main`, `master`, or `develop` runs the same command through [GitHub Actions](.github/workflows/ci.yml). The workflow uses Java 21, Maven dependency caching, and uploads Surefire reports when tests fail.
+
+## Automated Testing
+
+The repository contains JUnit 5 and Mockito unit tests for each business service and the API Gateway filters. Additional focused tests cover the Profile and Notification RabbitMQ DLQ declarations and listener factory wiring. Run unit tests with:
+
+```bash
+./mvnw test
+```
+
+The Profile module includes a Testcontainers integration test that starts RabbitMQ in Docker and verifies the real DLX-to-DLQ route. `./mvnw verify` runs these `*IT` tests through Maven Failsafe, so Docker must be available for the full build. Unit tests remain Docker-free.
+
+The API Gateway includes an opt-in end-to-end health smoke test. Run it against an already running gateway with:
+
+```bash
+E2E_BASE_URL=http://localhost:8080 ./mvnw -pl api-gateway -De2e.run=true verify
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:E2E_BASE_URL = "http://localhost:8080"
+./mvnw.cmd -pl api-gateway -De2e.run=true verify
+```
+
+The normal GitHub Actions CI job runs unit and RabbitMQ integration tests on Docker-enabled runners. The gateway E2E test remains opt-in because it requires a deployed gateway and its dependent services.
 
 Configuration is loaded through the Config Server from [config-repo](config-repo). The most relevant environment variables are:
 
