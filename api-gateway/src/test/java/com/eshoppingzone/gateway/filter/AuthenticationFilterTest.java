@@ -50,6 +50,34 @@ class AuthenticationFilterTest {
     }
 
     @Test
+    @DisplayName("Refresh endpoint (/api/v1/auth/refresh) should bypass gateway auth filter")
+    void testRefreshEndpointBypassesAuth() {
+        when(chain.filter(any())).thenReturn(Mono.empty());
+
+        MockServerHttpRequest request = MockServerHttpRequest.post("/api/v1/auth/refresh").build();
+        MockServerWebExchange exchange = MockServerWebExchange.from(request);
+
+        filter.filter(exchange, chain).block();
+
+        verify(chain, times(1)).filter(exchange);
+        assertNotEquals(HttpStatus.UNAUTHORIZED, exchange.getResponse().getStatusCode());
+    }
+
+    @Test
+    @DisplayName("Logout endpoint (/api/v1/auth/logout) should bypass gateway auth filter")
+    void testLogoutEndpointBypassesAuth() {
+        when(chain.filter(any())).thenReturn(Mono.empty());
+
+        MockServerHttpRequest request = MockServerHttpRequest.post("/api/v1/auth/logout").build();
+        MockServerWebExchange exchange = MockServerWebExchange.from(request);
+
+        filter.filter(exchange, chain).block();
+
+        verify(chain, times(1)).filter(exchange);
+        assertNotEquals(HttpStatus.UNAUTHORIZED, exchange.getResponse().getStatusCode());
+    }
+
+    @Test
     @DisplayName("Protected endpoints without token should return HTTP 401 Unauthorized")
     void testProtectedEndpointWithoutTokenReturns401() {
         MockServerHttpRequest request = MockServerHttpRequest.get("/api/v1/orders/1").build();
@@ -62,9 +90,9 @@ class AuthenticationFilterTest {
     }
 
     @Test
-    @DisplayName("Protected endpoints with valid token should propagate user headers")
+    @DisplayName("Protected endpoints with valid access token should propagate user headers")
     void testValidTokenPropagatesHeaders() {
-        String token = "valid.jwt.token";
+        String token = "valid.jwt.access.token";
         when(jwtUtil.isTokenValid(token)).thenReturn(true);
         when(jwtUtil.extractUserId(token)).thenReturn(42L);
         when(jwtUtil.extractRole(token)).thenReturn("ROLE_CUSTOMER");
@@ -81,5 +109,23 @@ class AuthenticationFilterTest {
 
         verify(chain, times(1)).filter(any());
         assertNotEquals(HttpStatus.UNAUTHORIZED, exchange.getResponse().getStatusCode());
+    }
+
+    @Test
+    @DisplayName("Protected endpoints with refresh token should be rejected with HTTP 401 Unauthorized")
+    void testProtectedEndpointWithRefreshTokenReturns401() {
+        String token = "valid.jwt.refresh.token";
+        when(jwtUtil.isTokenValid(token)).thenReturn(false);
+        when(jwtUtil.getTokenType(token)).thenReturn("REFRESH");
+
+        MockServerHttpRequest request = MockServerHttpRequest.get("/api/v1/orders/1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .build();
+        MockServerWebExchange exchange = MockServerWebExchange.from(request);
+
+        filter.filter(exchange, chain).block();
+
+        verify(chain, never()).filter(any());
+        assertEquals(HttpStatus.UNAUTHORIZED, exchange.getResponse().getStatusCode());
     }
 }

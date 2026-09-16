@@ -4,7 +4,9 @@ import com.eshoppingzone.auth.entity.Role;
 import com.eshoppingzone.auth.entity.UserStatus;
 
 public class AuthResponse {
-    private String token;
+    private String accessToken;
+    private String refreshToken;
+    private String tokenType = "Bearer";
     private Long userId;
     private String username;
     private String email;
@@ -15,8 +17,10 @@ public class AuthResponse {
     public AuthResponse() {
     }
 
-    public AuthResponse(String token, Long userId, String username, String email, String fullName, Role role, UserStatus status) {
-        this.token = token;
+    public AuthResponse(String accessToken, String refreshToken, Long userId, String username, String email, String fullName, Role role, UserStatus status) {
+        this.accessToken = accessToken;
+        this.refreshToken = refreshToken;
+        this.tokenType = "Bearer";
         this.userId = userId;
         this.username = username;
         this.email = email;
@@ -25,12 +29,42 @@ public class AuthResponse {
         this.status = status;
     }
 
+    // Backwards-compatible constructor
+    public AuthResponse(String accessToken, Long userId, String username, String email, String fullName, Role role, UserStatus status) {
+        this(accessToken, null, userId, username, email, fullName, role, status);
+    }
+
+    // Backwards-compatible getter & setter for token
     public String getToken() {
-        return token;
+        return accessToken;
     }
 
     public void setToken(String token) {
-        this.token = token;
+        this.accessToken = token;
+    }
+
+    public String getAccessToken() {
+        return accessToken;
+    }
+
+    public void setAccessToken(String accessToken) {
+        this.accessToken = accessToken;
+    }
+
+    public String getRefreshToken() {
+        return refreshToken;
+    }
+
+    public void setRefreshToken(String refreshToken) {
+        this.refreshToken = refreshToken;
+    }
+
+    public String getTokenType() {
+        return tokenType;
+    }
+
+    public void setTokenType(String tokenType) {
+        this.tokenType = tokenType;
     }
 
     public Long getUserId() {

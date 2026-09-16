@@ -25,6 +25,8 @@ public class AuthenticationFilter implements GlobalFilter, Ordered {
     private static final List<String> PUBLIC_ENDPOINTS = List.of(
             "/api/v1/auth/register",
             "/api/v1/auth/login",
+            "/api/v1/auth/refresh",
+            "/api/v1/auth/logout",
             "/api/v1/auth/forgot-password",
             "/api/v1/auth/reset-password",
             "/v3/api-docs",
@@ -74,6 +76,10 @@ public class AuthenticationFilter implements GlobalFilter, Ordered {
 
                 return chain.filter(exchange.mutate().request(builder.build()).build());
             } else if (!isPublic) {
+                String tokenType = jwtUtil.getTokenType(token);
+                if ("REFRESH".equalsIgnoreCase(tokenType)) {
+                    return onError(exchange, "Invalid token type: Refresh token cannot be used for API access", HttpStatus.UNAUTHORIZED);
+                }
                 return onError(exchange, "Invalid or expired JWT token", HttpStatus.UNAUTHORIZED);
             }
         } else if (!isPublic) {

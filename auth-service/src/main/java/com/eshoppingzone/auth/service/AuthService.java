@@ -9,6 +9,8 @@ import java.util.List;
 public interface AuthService {
     UserDto register(RegisterRequest request);
     AuthResponse login(LoginRequest request);
+    TokenRefreshResponse refreshToken(RefreshTokenRequest request);
+    void logout(LogoutRequest request);
     UserDto getCurrentUser(String username);
     void forgotPassword(ForgotPasswordRequest request);
     void resetPassword(ResetPasswordRequest request);
@@ -17,4 +19,3 @@ public interface AuthService {
     UserDto getUserById(Long id);
     UserDto updateUserStatus(Long id, UserStatus status);
 }
-

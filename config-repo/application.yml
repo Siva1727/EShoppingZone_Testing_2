@@ -42,7 +42,9 @@ eureka:
 
 jwt:
   secret: ${JWT_SECRET:404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970}
-  expirationMs: ${JWT_EXPIRATION_MS:86400000}
+  access-token-expiration-ms: ${JWT_ACCESS_TOKEN_EXPIRATION_MS:900000}
+  refresh-token-expiration-ms: ${JWT_REFRESH_TOKEN_EXPIRATION_MS:604800000}
+  expirationMs: ${JWT_EXPIRATION_MS:900000}
 
 management:
   tracing:

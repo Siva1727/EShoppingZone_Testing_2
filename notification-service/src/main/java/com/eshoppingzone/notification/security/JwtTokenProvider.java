@@ -22,8 +22,9 @@ public class JwtTokenProvider {
 
     public boolean validateToken(String token) {
         try {
-            Jwts.parser().verifyWith(getSigningKey()).build().parseSignedClaims(token);
-            return true;
+            Claims claims = Jwts.parser().verifyWith(getSigningKey()).build().parseSignedClaims(token).getPayload();
+            String type = (String) claims.get("type");
+            return type == null || "ACCESS".equalsIgnoreCase(type);
         } catch (Exception ex) {
             return false;
         }

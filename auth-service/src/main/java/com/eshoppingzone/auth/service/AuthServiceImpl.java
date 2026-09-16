@@ -3,6 +3,7 @@ package com.eshoppingzone.auth.service;
 import com.eshoppingzone.auth.config.RabbitMQConfig;
 import com.eshoppingzone.auth.dto.*;
 import com.eshoppingzone.auth.entity.PasswordResetToken;
+import com.eshoppingzone.auth.entity.RefreshToken;
 import com.eshoppingzone.auth.entity.Role;
 import com.eshoppingzone.auth.entity.User;
 import com.eshoppingzone.auth.entity.UserStatus;
@@ -11,6 +12,7 @@ import com.eshoppingzone.auth.exception.InvalidCredentialsException;
 import com.eshoppingzone.auth.exception.InvalidTokenException;
 import com.eshoppingzone.auth.exception.ResourceNotFoundException;
 import com.eshoppingzone.auth.repository.PasswordResetTokenRepository;
+import com.eshoppingzone.auth.repository.RefreshTokenRepository;
 import com.eshoppingzone.auth.repository.UserRepository;
 import com.eshoppingzone.auth.security.JwtTokenProvider;
 import org.slf4j.Logger;
@@ -32,17 +34,20 @@ public class AuthServiceImpl implements AuthService {
 
     private final UserRepository userRepository;
     private final PasswordResetTokenRepository tokenRepository;
+    private final RefreshTokenRepository refreshTokenRepository;
     private final PasswordEncoder passwordEncoder;
     private final JwtTokenProvider jwtTokenProvider;
     private final RabbitTemplate rabbitTemplate;
 
     public AuthServiceImpl(UserRepository userRepository,
                            PasswordResetTokenRepository tokenRepository,
+                           RefreshTokenRepository refreshTokenRepository,
                            PasswordEncoder passwordEncoder,
                            JwtTokenProvider jwtTokenProvider,
                            RabbitTemplate rabbitTemplate) {
         this.userRepository = userRepository;
         this.tokenRepository = tokenRepository;
+        this.refreshTokenRepository = refreshTokenRepository;
         this.passwordEncoder = passwordEncoder;
         this.jwtTokenProvider = jwtTokenProvider;
         this.rabbitTemplate = rabbitTemplate;
@@ -87,6 +92,7 @@ public class AuthServiceImpl implements AuthService {
     }
 
     @Override
+    @Transactional
     public AuthResponse login(LoginRequest request) {
         User user = userRepository.findByUsername(request.getUsername())
                 .orElseThrow(() -> new InvalidCredentialsException("Invalid username or password"));
@@ -102,9 +108,17 @@ public class AuthServiceImpl implements AuthService {
             throw new InvalidCredentialsException("Account is inactive. Please contact support.");
         }
 
-        String token = jwtTokenProvider.generateToken(user);
+        String accessToken = jwtTokenProvider.generateAccessToken(user);
+        String refreshJti = UUID.randomUUID().toString();
+        String refreshToken = jwtTokenProvider.generateRefreshToken(user, refreshJti);
+
+        LocalDateTime expiryDate = LocalDateTime.now().plusSeconds(jwtTokenProvider.getRefreshTokenExpirationMs() / 1000);
+        RefreshToken refreshTokenEntity = new RefreshToken(refreshJti, user, expiryDate);
+        refreshTokenRepository.save(refreshTokenEntity);
+
         return new AuthResponse(
-                token,
+                accessToken,
+                refreshToken,
                 user.getId(),
                 user.getUsername(),
                 user.getEmail(),
@@ -112,6 +126,105 @@ public class AuthServiceImpl implements AuthService {
                 user.getRole(),
                 user.getStatus()
         );
+    }
+
+    @Override
+    @Transactional
+    public TokenRefreshResponse refreshToken(RefreshTokenRequest request) {
+        String token = request.getRefreshToken();
+        if (token == null || token.isBlank()) {
+            throw new InvalidTokenException("Refresh token cannot be blank");
+        }
+
+        if (!jwtTokenProvider.validateToken(token)) {
+            throw new InvalidTokenException("Invalid or expired refresh token");
+        }
+
+        String tokenType = jwtTokenProvider.getTokenType(token);
+        if (JwtTokenProvider.TOKEN_TYPE_ACCESS.equalsIgnoreCase(tokenType)) {
+            throw new InvalidTokenException("Access token cannot be used to refresh tokens. Please provide a valid refresh token.");
+        }
+        if (!JwtTokenProvider.TOKEN_TYPE_REFRESH.equalsIgnoreCase(tokenType)) {
+            throw new InvalidTokenException("Invalid token type. Expected a refresh token.");
+        }
+
+        String jti = jwtTokenProvider.getJti(token);
+        if (jti == null || jti.isBlank()) {
+            throw new InvalidTokenException("Invalid refresh token: missing JTI");
+        }
+
+        RefreshToken tokenRecord = refreshTokenRepository.findByJti(jti)
+                .orElseThrow(() -> new InvalidTokenException("Refresh token not found or invalid"));
+
+        if (tokenRecord.isRevoked()) {
+            throw new InvalidTokenException("Revoked refresh token reuse detected. Please log in again.");
+        }
+
+        if (tokenRecord.isExpired()) {
+            throw new InvalidTokenException("Refresh token has expired. Please log in again.");
+        }
+
+        User user = tokenRecord.getUser();
+        if (user.getStatus() == UserStatus.BLOCKED) {
+            throw new InvalidCredentialsException("Account has been blocked. Please contact support.");
+        }
+        if (user.getStatus() == UserStatus.INACTIVE) {
+            throw new InvalidCredentialsException("Account is inactive. Please contact support.");
+        }
+
+        // Token rotation: Revoke existing refresh token and link to new JTI
+        String newRefreshJti = UUID.randomUUID().toString();
+        tokenRecord.setRevoked(true);
+        tokenRecord.setRevokedAt(LocalDateTime.now());
+        tokenRecord.setReplacedByJti(newRefreshJti);
+        refreshTokenRepository.save(tokenRecord);
+
+        // Generate new token pair
+        String newAccessToken = jwtTokenProvider.generateAccessToken(user);
+        String newRefreshToken = jwtTokenProvider.generateRefreshToken(user, newRefreshJti);
+
+        LocalDateTime newExpiryDate = LocalDateTime.now().plusSeconds(jwtTokenProvider.getRefreshTokenExpirationMs() / 1000);
+        RefreshToken newRecord = new RefreshToken(newRefreshJti, user, newExpiryDate);
+        refreshTokenRepository.save(newRecord);
+
+        return new TokenRefreshResponse(
+                newAccessToken,
+                newRefreshToken,
+                "Bearer",
+                jwtTokenProvider.getAccessTokenExpirationSeconds()
+        );
+    }
+
+    @Override
+    @Transactional
+    public void logout(LogoutRequest request) {
+        String token = request.getRefreshToken();
+        if (token == null || token.isBlank()) {
+            throw new InvalidTokenException("Refresh token is required for logout");
+        }
+
+        if (!jwtTokenProvider.validateToken(token)) {
+            throw new InvalidTokenException("Invalid or expired refresh token");
+        }
+
+        String tokenType = jwtTokenProvider.getTokenType(token);
+        if (JwtTokenProvider.TOKEN_TYPE_ACCESS.equalsIgnoreCase(tokenType)) {
+            throw new InvalidTokenException("Invalid token type for logout. Expected a refresh token.");
+        }
+        if (!JwtTokenProvider.TOKEN_TYPE_REFRESH.equalsIgnoreCase(tokenType)) {
+            throw new InvalidTokenException("Invalid token type for logout.");
+        }
+
+        String jti = jwtTokenProvider.getJti(token);
+        if (jti != null && !jti.isBlank()) {
+            refreshTokenRepository.findByJti(jti).ifPresent(record -> {
+                if (!record.isRevoked()) {
+                    record.setRevoked(true);
+                    record.setRevokedAt(LocalDateTime.now());
+                    refreshTokenRepository.save(record);
+                }
+            });
+        }
     }
 
     @Override

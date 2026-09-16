@@ -12,7 +12,7 @@ import org.springframework.web.bind.annotation.*;
 
 @RestController
 @RequestMapping("/api/v1/auth")
-@Tag(name = "Authentication", description = "APIs for user registration, login, profile, and password reset")
+@Tag(name = "Authentication", description = "APIs for user registration, login, token refresh, logout, profile, and password reset")
 public class AuthController {
 
     private final AuthService authService;
@@ -29,10 +29,24 @@ public class AuthController {
     }
 
     @PostMapping("/login")
-    @Operation(summary = "User Login", description = "Public endpoint to authenticate and retrieve JWT token")
+    @Operation(summary = "User Login", description = "Public endpoint to authenticate and retrieve access and refresh tokens")
     public ResponseEntity<ApiResponse<AuthResponse>> login(@Valid @RequestBody LoginRequest request) {
         AuthResponse response = authService.login(request);
         return ResponseEntity.ok(ApiResponse.success("Login successful", response));
+    }
+
+    @PostMapping("/refresh")
+    @Operation(summary = "Refresh Access Token", description = "Public endpoint to obtain a new access token and rotated refresh token using a valid refresh token")
+    public ResponseEntity<ApiResponse<TokenRefreshResponse>> refreshToken(@Valid @RequestBody RefreshTokenRequest request) {
+        TokenRefreshResponse response = authService.refreshToken(request);
+        return ResponseEntity.ok(ApiResponse.success("Token refreshed successfully", response));
+    }
+
+    @PostMapping("/logout")
+    @Operation(summary = "User Logout", description = "Endpoint to invalidate the current server-side refresh token session")
+    public ResponseEntity<ApiResponse<Void>> logout(@Valid @RequestBody LogoutRequest request) {
+        authService.logout(request);
+        return ResponseEntity.ok(ApiResponse.success("Logged out successfully", null));
     }
 
     @GetMapping("/me")

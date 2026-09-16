@@ -28,10 +28,31 @@ public class JwtUtil {
 
     public boolean isTokenValid(String token) {
         try {
-            extractAllClaims(token);
-            return true;
+            Claims claims = extractAllClaims(token);
+            String type = (String) claims.get("type");
+            // Only ACCESS tokens are valid for gateway routing to protected endpoints
+            return type == null || "ACCESS".equalsIgnoreCase(type);
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    public boolean isAccessToken(String token) {
+        try {
+            Claims claims = extractAllClaims(token);
+            String type = (String) claims.get("type");
+            return type == null || "ACCESS".equalsIgnoreCase(type);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public String getTokenType(String token) {
+        try {
+            Claims claims = extractAllClaims(token);
+            return (String) claims.get("type");
+        } catch (Exception e) {
+            return null;
         }
     }
 
