@@ -1,5 +1,6 @@
 package com.eshoppingzone.notification.dto;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
@@ -8,6 +9,7 @@ public class OrderEvent {
     private String eventType;
     private Long orderId;
     private Long customerId;
+    @JsonAlias({"amount", "totalAmount"})
     private BigDecimal totalAmount;
     private String paymentMethod;
     private String status;

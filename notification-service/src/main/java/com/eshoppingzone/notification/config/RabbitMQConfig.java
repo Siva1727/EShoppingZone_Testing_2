@@ -24,10 +24,10 @@ public class RabbitMQConfig {
     public static final String QUEUE_PAYMENT_NOTIFICATIONS = "notification.payment.queue";
     public static final String QUEUE_DELIVERY_NOTIFICATIONS = "notification.delivery.queue";
 
-    public static final String ROUTING_KEY_USER = "user.#";
-    public static final String ROUTING_KEY_ORDER = "order.#";
-    public static final String ROUTING_KEY_PAYMENT = "payment.#";
-    public static final String ROUTING_KEY_REFUND = "refund.#";
+    public static final String ROUTING_KEY_USER = "eshoppingzone.user.#";
+    public static final String ROUTING_KEY_ORDER = "eshoppingzone.order.#";
+    public static final String ROUTING_KEY_PAYMENT = "eshoppingzone.payment.#";
+    public static final String ROUTING_KEY_REFUND = "eshoppingzone.refund.#";
     public static final String ROUTING_KEY_DELIVERY = "delivery.#";
 
     @Bean
@@ -36,8 +36,8 @@ public class RabbitMQConfig {
     }
 
     @Bean
-    public DirectExchange deadLetterExchange() {
-        return new DirectExchange(DLX);
+    public TopicExchange deadLetterExchange() {
+        return new TopicExchange(DLX);
     }
 
     @Bean
@@ -46,7 +46,7 @@ public class RabbitMQConfig {
     }
 
     @Bean
-    public Binding deadLetterBinding(Queue deadLetterQueue, DirectExchange deadLetterExchange) {
+    public Binding deadLetterBinding(Queue deadLetterQueue, TopicExchange deadLetterExchange) {
         return BindingBuilder.bind(deadLetterQueue).to(deadLetterExchange).with(DLQ_ROUTING_KEY);
     }
 

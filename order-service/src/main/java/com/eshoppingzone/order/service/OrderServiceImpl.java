@@ -81,9 +81,21 @@ public class OrderServiceImpl implements OrderService {
         // 1. Idempotency Key Handling
         String effectiveIdempotencyKey = (idempotencyKey != null && !idempotencyKey.isBlank())
                 ? idempotencyKey.trim()
+                : null;
+
+        // 2. Check if Saga already exists for this idempotency key BEFORE calling cart-service or checking empty cart
+        if (effectiveIdempotencyKey != null) {
+            Optional<OrderSagaState> existingSagaOpt = sagaStateService.findByIdempotencyKey(effectiveIdempotencyKey);
+            if (existingSagaOpt.isPresent()) {
+                return handleExistingSaga(existingSagaOpt.get(), customerId, request);
+            }
+        }
+
+        String finalIdempotencyKey = (effectiveIdempotencyKey != null)
+                ? effectiveIdempotencyKey
                 : UUID.randomUUID().toString();
 
-        // 2. Fetch items from Customer's Cart
+        // 3. Fetch items from Customer's Cart
         ApiResponse<CartDto> cartResponse = cartClient.getCartByCustomerId(customerId);
         if (cartResponse == null || cartResponse.getData() == null || cartResponse.getData().getItems().isEmpty()) {
             throw new InvalidOrderStateException("Shopping cart is empty. Cannot place order.");
@@ -92,16 +104,10 @@ public class OrderServiceImpl implements OrderService {
         CartDto cart = cartResponse.getData();
         List<CartItemDto> cartItems = cart.getItems();
 
-        // 3. Compute deterministic request fingerprint
+        // 4. Compute deterministic request fingerprint
         String requestFingerprint = RequestFingerprintUtil.computeFingerprint(customerId, cartItems, request);
 
-        // 4. Check if Saga already exists for this idempotency key
-        Optional<OrderSagaState> existingSagaOpt = sagaStateService.findByIdempotencyKey(effectiveIdempotencyKey);
-        if (existingSagaOpt.isPresent()) {
-            return handleExistingSaga(existingSagaOpt.get(), customerId, requestFingerprint);
-        }
-
-        // 3. Fetch shipping address
+        // 5. Fetch shipping address
         String street = request.getShippingStreet();
         String city = request.getShippingCity();
         String state = request.getShippingState();
@@ -132,7 +138,7 @@ public class OrderServiceImpl implements OrderService {
             country = "Country";
         }
 
-        // 4. Create initial Order entity in PENDING_PAYMENT
+        // 6. Create initial Order entity in PENDING_PAYMENT
         String orderNumber = "ORD-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
         Order order = new Order();
         order.setOrderNumber(orderNumber);
@@ -189,11 +195,11 @@ public class OrderServiceImpl implements OrderService {
 
         Order savedOrder = orderRepository.save(order);
 
-        // 5. Construct Saga Context and execute Checkout Saga Orchestration
+        // 7. Construct Saga Context and execute Checkout Saga Orchestration
         String sagaId = "SAGA-" + orderNumber + "-" + UUID.randomUUID().toString().substring(0, 6).toUpperCase();
         CheckoutSagaContext context = new CheckoutSagaContext(
                 sagaId,
-                effectiveIdempotencyKey,
+                finalIdempotencyKey,
                 requestFingerprint,
                 customerId,
                 savedOrder,
@@ -204,25 +210,32 @@ public class OrderServiceImpl implements OrderService {
         return checkoutSagaOrchestrator.executeSaga(context);
     }
 
-    private OrderDto handleExistingSaga(OrderSagaState existingSaga, Long customerId, String requestFingerprint) {
+    private OrderDto handleExistingSaga(OrderSagaState existingSaga, Long customerId, CheckoutRequest request) {
         if (!existingSaga.getCustomerId().equals(customerId)) {
             throw new InvalidOrderStateException("Idempotency key belongs to another customer or request");
         }
-        if (existingSaga.getRequestFingerprint() != null && !existingSaga.getRequestFingerprint().equals(requestFingerprint)) {
+
+        Order existingOrder = orderRepository.findById(existingSaga.getOrderId())
+                .orElseThrow(() -> new ResourceNotFoundException("Order not found with id: " + existingSaga.getOrderId()));
+
+        List<CartItemDto> orderItemsAsCart = existingOrder.getItems().stream()
+                .map(i -> new CartItemDto(null, i.getProductId(), i.getProductName(), i.getUnitPrice(), i.getQuantity(), i.getLineTotal()))
+                .collect(Collectors.toList());
+
+        String computedFingerprint = RequestFingerprintUtil.computeFingerprint(customerId, orderItemsAsCart, request);
+
+        if (existingSaga.getRequestFingerprint() != null && !existingSaga.getRequestFingerprint().equals(computedFingerprint)) {
             throw new IdempotencyConflictException("Idempotency key reused with different checkout request parameters");
         }
+
         if (existingSaga.getStatus() == SagaStatus.COMPLETED || existingSaga.getStatus() == SagaStatus.INVENTORY_CONFIRMED || existingSaga.getStatus() == SagaStatus.CART_CLEARED) {
             log.info("Idempotent checkout request: returning already COMPLETED order ID: {}", existingSaga.getOrderId());
-            Order completedOrder = orderRepository.findById(existingSaga.getOrderId())
-                    .orElseThrow(() -> new ResourceNotFoundException("Order not found with id: " + existingSaga.getOrderId()));
-            return OrderDto.fromEntity(completedOrder);
+            return OrderDto.fromEntity(existingOrder);
         } else if (existingSaga.getStatus() == SagaStatus.FAILED) {
             throw new PaymentException("Previous checkout with this idempotency key failed: " + existingSaga.getFailureReason());
         } else {
             // Saga is currently in flight or in reconciliation
-            Order inFlightOrder = orderRepository.findById(existingSaga.getOrderId())
-                    .orElseThrow(() -> new ResourceNotFoundException("Order not found with id: " + existingSaga.getOrderId()));
-            return OrderDto.fromEntity(inFlightOrder);
+            return OrderDto.fromEntity(existingOrder);
         }
     }
 

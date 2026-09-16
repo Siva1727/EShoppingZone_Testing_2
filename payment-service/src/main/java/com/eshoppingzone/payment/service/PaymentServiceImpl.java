@@ -47,7 +47,7 @@ public class PaymentServiceImpl implements PaymentService {
     }
 
     @Override
-    @Transactional
+    @Transactional(noRollbackFor = PaymentException.class)
     public PaymentDto processPayment(ProcessPaymentRequest request) {
         log.info("Processing payment for orderId: {}, customerId: {}, amount: {}, method: {}",
                 request.getOrderId(), request.getCustomerId(), request.getAmount(), request.getPaymentMethod());

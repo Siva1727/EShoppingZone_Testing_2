@@ -2,6 +2,7 @@ package com.eshoppingzone.payment.service;
 
 import com.eshoppingzone.payment.client.OrderClient;
 import com.eshoppingzone.payment.client.WalletClient;
+import com.eshoppingzone.payment.config.RabbitMQConfig;
 import com.eshoppingzone.payment.dto.*;
 import com.eshoppingzone.payment.entity.*;
 import com.eshoppingzone.payment.exception.InvalidRefundException;
@@ -11,6 +12,7 @@ import com.eshoppingzone.payment.repository.RefundRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -77,7 +79,7 @@ public class PaymentServiceTest {
         assertEquals(PaymentMethod.WALLET, result.getPaymentMethod());
         verify(walletClient).debit(any(WalletTransferRequest.class));
         verify(walletClient).credit(any(WalletTransferRequest.class));
-        verify(rabbitTemplate).convertAndSend(anyString(), anyString(), any(PaymentEvent.class));
+        verify(rabbitTemplate).convertAndSend(eq(RabbitMQConfig.EXCHANGE_NAME), eq(RabbitMQConfig.PAYMENT_SUCCESS_ROUTING_KEY), any(PaymentEvent.class));
     }
 
     @Test
@@ -94,7 +96,43 @@ public class PaymentServiceTest {
         });
 
         assertThrows(PaymentException.class, () -> paymentService.processPayment(req));
-        verify(paymentRepository, atLeastOnce()).save(any(Payment.class));
+        verify(paymentRepository, atLeastOnce()).save(argThat(p -> p.getStatus() == PaymentStatus.FAILED));
+        verify(rabbitTemplate).convertAndSend(eq(RabbitMQConfig.EXCHANGE_NAME), eq(RabbitMQConfig.PAYMENT_FAILED_ROUTING_KEY), any(PaymentEvent.class));
+    }
+
+    @Test
+    void testFailedPaymentRecordRemainsPersistedWithStatusFailed() {
+        ProcessPaymentRequest req = new ProcessPaymentRequest(24L, 51L, new BigDecimal("899.99"), PaymentMethod.WALLET);
+
+        when(paymentRepository.findByOrderId(24L)).thenReturn(Optional.empty());
+        when(walletClient.debit(any(WalletTransferRequest.class)))
+                .thenThrow(new RuntimeException("Wallet debit failed: insufficient funds"));
+        when(paymentRepository.save(any(Payment.class))).thenAnswer(invocation -> {
+            Payment p = invocation.getArgument(0);
+            p.setId(24L);
+            return p;
+        });
+
+        assertThrows(PaymentException.class, () -> paymentService.processPayment(req));
+
+        ArgumentCaptor<Payment> paymentCaptor = ArgumentCaptor.forClass(Payment.class);
+        verify(paymentRepository, atLeastOnce()).save(paymentCaptor.capture());
+
+        Payment savedPayment = paymentCaptor.getValue();
+        assertNotNull(savedPayment);
+        assertEquals(24L, savedPayment.getOrderId());
+        assertEquals(51L, savedPayment.getCustomerId());
+        assertEquals(new BigDecimal("899.99"), savedPayment.getAmount());
+        assertEquals(PaymentMethod.WALLET, savedPayment.getPaymentMethod());
+        assertEquals(PaymentStatus.FAILED, savedPayment.getStatus());
+        assertNotNull(savedPayment.getTransactionReference());
+
+        // Verifying lookup of the persisted failed payment succeeds
+        when(paymentRepository.findByOrderId(24L)).thenReturn(Optional.of(savedPayment));
+        PaymentDto foundPayment = paymentService.getPaymentByOrderId(24L);
+        assertNotNull(foundPayment);
+        assertEquals(24L, foundPayment.getOrderId());
+        assertEquals(PaymentStatus.FAILED, foundPayment.getStatus());
     }
 
     @Test
@@ -114,6 +152,40 @@ public class PaymentServiceTest {
         assertEquals(PaymentStatus.PENDING, result.getStatus());
         assertEquals(PaymentMethod.COD, result.getPaymentMethod());
         verifyNoInteractions(walletClient);
+    }
+
+    @Test
+    void testProcessPaymentIdempotencyAlreadySuccess() {
+        ProcessPaymentRequest req = new ProcessPaymentRequest(100L, 4L, new BigDecimal("250.00"), PaymentMethod.WALLET);
+
+        when(paymentRepository.findByOrderId(100L)).thenReturn(Optional.of(mockPayment));
+
+        PaymentDto result = paymentService.processPayment(req);
+
+        assertNotNull(result);
+        assertEquals(PaymentStatus.SUCCESS, result.getStatus());
+        verifyNoInteractions(walletClient);
+        verify(paymentRepository, never()).save(any(Payment.class));
+    }
+
+    @Test
+    void testProcessPaymentIdempotencyRetryAfterFailure() {
+        ProcessPaymentRequest req = new ProcessPaymentRequest(100L, 4L, new BigDecimal("250.00"), PaymentMethod.WALLET);
+        Payment existingFailedPayment = new Payment(1L, 100L, 4L, new BigDecimal("250.00"), PaymentMethod.WALLET, PaymentStatus.FAILED, "TXN-OLD");
+
+        when(paymentRepository.findByOrderId(100L)).thenReturn(Optional.of(existingFailedPayment));
+        when(walletClient.debit(any(WalletTransferRequest.class)))
+                .thenReturn(ApiResponse.success("Debited", new WalletDto(1L, 4L, new BigDecimal("750.00"))));
+        when(walletClient.credit(any(WalletTransferRequest.class)))
+                .thenReturn(ApiResponse.success("Credited", new WalletDto(2L, 1L, new BigDecimal("1250.00"))));
+        when(paymentRepository.save(any(Payment.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        PaymentDto result = paymentService.processPayment(req);
+
+        assertNotNull(result);
+        assertEquals(PaymentStatus.SUCCESS, result.getStatus());
+        verify(walletClient).debit(any(WalletTransferRequest.class));
+        verify(paymentRepository).save(argThat(p -> p.getStatus() == PaymentStatus.SUCCESS));
     }
 
     @Test
