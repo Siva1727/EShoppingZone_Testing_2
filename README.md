@@ -13,6 +13,7 @@ EShoppingZone is a Spring Boot and Spring Cloud e-commerce platform composed of 
 - ✅ Delivery Service
 - ✅ Notification Service
 - ✅ Wallet Service
+- ✅ Recommendation Service
 - ✅ API Gateway
 
 ### Platform Components
@@ -30,6 +31,7 @@ EShoppingZone is a Spring Boot and Spring Cloud e-commerce platform composed of 
 - Wallet Service: wallet balances and transactions
 - Delivery Service: delivery assignment and status management
 - Notification Service: asynchronous user, order, payment, and delivery notifications
+- Recommendation Service: customer-specific rule-based product recommendations
 
 ### Completed Cross-Cutting Capabilities
 
@@ -38,8 +40,102 @@ EShoppingZone is a Spring Boot and Spring Cloud e-commerce platform composed of 
 - Trace observation for HTTP requests and RabbitMQ publishers/listeners
 - RabbitMQ retry and dead-letter handling for Profile and Notification consumers
 - Three listener attempts with exponential backoff before failed messages are republished to `eshoppingzone.dlq`
+- Customer-specific recommendations based on repeated product views
 
 The service business workflows remain under active testing. The observability and messaging foundations are implemented without changing existing service queue names or event routing keys.
+
+## Recommendation Service
+
+The Recommendation Service provides a customer-specific, rule-based recommendation flow. It does not use machine learning, AI, embeddings, or a shared global product-view count.
+
+### Recommendation Rule
+
+When an authenticated customer views the same active product three or more times:
+
+```text
+Customer 101 views Product 501:
+1st view -> count 1 -> not recommended
+2nd view -> count 2 -> not recommended
+3rd view -> count 3 -> recommended
+4th view -> count 4 -> remains recommended
+```
+
+View counts are tracked independently for each `(customer_id, product_id)` pair, so one customer's views never create recommendations for another customer.
+
+### Recommendation API
+
+```text
+GET /api/v1/recommendations
+```
+
+The endpoint requires a valid access-token JWT. The authenticated customer's `userId` claim determines which recommendations are returned; a customer cannot request another customer's recommendations.
+
+Example response data:
+
+```json
+[
+  {
+    "productId": 501,
+    "reason": "VIEW_COUNT_THRESHOLD"
+  }
+]
+```
+
+### Product View Event Flow
+
+After a successful authenticated request to:
+
+```text
+GET /api/v1/products/{id}
+```
+
+Product Service publishes a `PRODUCT_VIEWED` event. Anonymous product browsing remains supported, but anonymous views are not associated with a customer and therefore do not affect recommendations.
+
+The event uses the existing RabbitMQ topic exchange:
+
+| Setting | Value |
+| --- | --- |
+| Exchange | `eshoppingzone.exchange` |
+| Routing key | `eshoppingzone.product.viewed` |
+| Queue | `eshoppingzone.recommendation.product.viewed.queue` |
+
+Recommendation Service consumes the event and atomically increments the customer's product-view record. RabbitMQ redelivery and concurrent events are handled with a unique `(customer_id, product_id)` constraint and an atomic database upsert.
+
+### Recommendation Persistence
+
+Recommendation Service uses a separate MySQL schema:
+
+```text
+eshoppingzone_recommendation
+```
+
+The `customer_product_view` table stores:
+
+```text
+customer_id
+product_id
+view_count
+recommended
+first_viewed_at
+last_viewed_at
+created_at
+updated_at
+```
+
+The `(customer_id, product_id)` pair is unique. `recommended` is `false` below three views and `true` at three or more views.
+
+### Recommendation Service Configuration
+
+| Setting | Value |
+| --- | --- |
+| Service name | `recommendation-service` |
+| Default port | `8091` |
+| Eureka registration | Enabled |
+| MySQL schema | `eshoppingzone_recommendation` |
+| Gateway path | `/api/v1/recommendations/**` |
+| Gateway destination | `lb://RECOMMENDATION-SERVICE` |
+
+Service-specific configuration is in [recommendation-service.yml](config-repo/recommendation-service.yml). The gateway route is defined in [api-gateway.yml](config-repo/api-gateway.yml) and the gateway's local [application.yml](api-gateway/src/main/resources/application.yml).
 
 ## Local Prerequisites
 
@@ -150,6 +246,7 @@ Listener failures are retried three times with exponential backoff. After the fi
 | Wallet Service | Wallet balances and transactions | REST and RabbitMQ | MySQL |
 | Delivery Service | Assignment and delivery status | REST, Feign, and RabbitMQ | MySQL |
 | Notification Service | User, order, payment, and delivery notifications | RabbitMQ | MySQL |
+| Recommendation Service | Customer-specific product-view recommendations | REST and RabbitMQ | MySQL |
 
 ### Infrastructure Map
 
@@ -159,6 +256,7 @@ Listener failures are retried three times with exponential backoff. After the fi
 | Eureka Server | Service registration and discovery | `http://localhost:8761` |
 | RabbitMQ | Domain event transport and asynchronous processing | `localhost:5672` |
 | `eshoppingzone.dlx` / `eshoppingzone.dlq` | Failed-message retention after consumer retries | RabbitMQ |
+| `eshoppingzone.product.viewed` / `eshoppingzone.recommendation.product.viewed.queue` | Customer product-view events for recommendations | RabbitMQ |
 | Zipkin | Distributed trace collection | `http://localhost:9411` |
 | Log collector | Ships ECS JSON logs to centralized storage | Deployment-specific |
 
@@ -209,8 +307,10 @@ flowchart LR
 1. A business service publishes an event to the shared `eshoppingzone.exchange` RabbitMQ topic exchange.
 2. Queues bind to event routing keys such as user, order, payment, delivery, and refund events.
 3. Profile and Notification consumers process their subscribed events asynchronously.
-4. RabbitMQ observation propagates trace context from the publisher to the consumer.
-5. Consumer failures are retried locally; exhausted retries are republished to `eshoppingzone.dlx` and stored in `eshoppingzone.dlq`.
+4. Product Service publishes authenticated product-detail views using `eshoppingzone.product.viewed`.
+5. Recommendation Service consumes product-view events and updates the customer/product view count.
+6. RabbitMQ observation propagates trace context from the publisher to the consumer.
+7. Consumer failures are retried locally; exhausted retries are republished to `eshoppingzone.dlx` and stored in `eshoppingzone.dlq`.
 
 ### Configuration Flow
 
@@ -226,6 +326,8 @@ config-repo/       Shared and service-specific external configuration
 config-server/     Spring Cloud Config Server
 eureka-server/     Service registry
 api-gateway/       Edge routing, authentication, and rate limiting
+recommendation-service/
+                   Customer-specific rule-based recommendations
 *-service/         Business microservices
 pom.xml            Parent build and shared dependency management
 ```

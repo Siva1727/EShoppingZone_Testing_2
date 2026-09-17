@@ -26,6 +26,11 @@ spring:
           predicates:
             - Path=/api/v1/products/**, /api/v1/merchant/products/**, /api/v1/admin/products/**
 
+        - id: recommendation-service-route
+          uri: lb://RECOMMENDATION-SERVICE
+          predicates:
+            - Path=/api/v1/recommendations/**
+
         - id: inventory-service-route
           uri: lb://INVENTORY-SERVICE
           predicates:
